@@ -5,6 +5,7 @@
 
 #include <linux/module.h>
 #include <linux/hrtimer.h>
+#include <linux/vmalloc.h>
 #include <sound/core.h>
 #include <sound/initval.h>
 #include <sound/pcm.h>
@@ -44,6 +45,8 @@ struct gip_headset {
 	struct delayed_work work_config;
 	struct delayed_work work_power_on;
 	struct work_struct work_register;
+	bool got_ready;
+	bool got_initial_volume;
 	bool registered;
 
 	struct hrtimer timer;
@@ -90,13 +93,34 @@ static int gip_headset_pcm_close(struct snd_pcm_substream *sub)
 static int gip_headset_pcm_hw_params(struct snd_pcm_substream *sub,
 				     struct snd_pcm_hw_params *params)
 {
-	return snd_pcm_lib_alloc_vmalloc_buffer(sub,
-						params_buffer_bytes(params));
+	struct snd_pcm_runtime *runtime = sub->runtime;
+	size_t size = params_buffer_bytes(params);
+
+	if (runtime->dma_area) {
+		if (runtime->dma_bytes >= size)
+			return 0; /* Already large enough */
+		vfree(runtime->dma_area);
+	}
+	runtime->dma_area = vzalloc(size);
+	if (!runtime->dma_area)
+		return -ENOMEM;
+	runtime->dma_bytes = size;
+	return 1;
 }
 
 static int gip_headset_pcm_hw_free(struct snd_pcm_substream *sub)
 {
-	return snd_pcm_lib_free_vmalloc_buffer(sub);
+	struct snd_pcm_runtime *runtime = sub->runtime;
+
+	vfree(runtime->dma_area);
+	runtime->dma_area = NULL;
+	return 0;
+}
+
+static struct page *gip_headset_pcm_get_page(struct snd_pcm_substream *sub,
+                                             unsigned long offset)
+{
+	return vmalloc_to_page(sub->runtime->dma_area + offset);
 }
 
 static int gip_headset_pcm_prepare(struct snd_pcm_substream *sub)
@@ -157,7 +181,7 @@ static const struct snd_pcm_ops gip_headset_pcm_ops = {
 	.prepare = gip_headset_pcm_prepare,
 	.trigger = gip_headset_pcm_trigger,
 	.pointer = gip_headset_pcm_pointer,
-	.page = snd_pcm_lib_get_vmalloc_page,
+	.page = gip_headset_pcm_get_page,
 };
 
 static bool gip_headset_advance_pointer(struct gip_headset_stream *stream,
@@ -389,9 +413,27 @@ static int gip_headset_op_authenticate(struct gip_client *client,
 	return gip_auth_process_pkt(&headset->auth, data, len);
 }
 
+static void gip_headset_maybe_register(struct gip_headset *headset)
+{
+	if (!headset->got_ready || !headset->got_initial_volume)
+		return;
+
+	/* ready signal is required as client->audio_config_out is initialized in it */
+	/* and used inside work_register -> gip_init_audio_out */
+	if (!headset->registered) {
+		schedule_work(&headset->work_register);
+		headset->registered = true;
+	}
+}
+
 static int gip_headset_op_audio_ready(struct gip_client *client)
 {
 	struct gip_headset *headset = dev_get_drvdata(&client->dev);
+
+	headset->got_ready = true;
+	/* headset reported supported audio formats */
+	/* (necessary for buffer size calculcations) */
+	gip_headset_maybe_register(headset);
 
 	schedule_delayed_work(&headset->work_power_on, GIP_HS_POWER_ON_DELAY);
 
@@ -403,11 +445,9 @@ static int gip_headset_op_audio_volume(struct gip_client *client,
 {
 	struct gip_headset *headset = dev_get_drvdata(&client->dev);
 
-	/* headset reported initial volume, start audio I/O */
-	if (!headset->registered) {
-		schedule_work(&headset->work_register);
-		headset->registered = true;
-	}
+	/* headset reported initial volume, maybe start audio I/O */
+	headset->got_initial_volume = true;
+	gip_headset_maybe_register(headset);
 
 	/* ignore hardware volume, let software handle volume changes */
 	return 0;
