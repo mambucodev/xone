@@ -22,7 +22,7 @@ if [ -f /usr/local/bin/xow ]; then
     exit 1
 fi
 
-if [ -n "${SUDO_USER:-}" ]; then
+if [ -z "$version" -a -n "${SUDO_USER:-}" ]; then
     # Run as normal user to prevent "unsafe repository" error
     version=$(sudo -u "$SUDO_USER" git describe --tags 2> /dev/null || echo unknown)
 else
