@@ -35,7 +35,7 @@ if [ "${1:-}" != --release ]; then
     echo 'ccflags-y += -DDEBUG' >> "$source/Kbuild"
 fi
 
-if dkms install -m xone -v "$version"; then
+if dkms install -m xone -v "$version" -k "$version"; then
     # The blacklist should be placed in /usr/local/lib/modprobe.d for kmod 29+
     install -D -m 644 install/modprobe.conf /etc/modprobe.d/xone-blacklist.conf
     install -D -m 755 install/firmware.sh /usr/local/bin/xone-get-firmware.sh
